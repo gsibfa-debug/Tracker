@@ -1529,7 +1529,7 @@ function openCollectionModal(){
 let journalFilter='';
 function renderJournal(){
   const list=[...state.transactions].reverse().filter(t=>!journalFilter||t.journal===journalFilter);
-  const journals={CA:'Journal Caisse',BQ:'Journal Banque',OD:'Journal Opérations Diverses',AC:'Journal des Achats',VE:'Journal des Ventes/Produits'};
+  const journals={CA:'Journal Caisse',BQ:'Journal Banque',OD:'Journal Opérations Diverses',AC:'Journal des Achats',VE:'Journal des Ventes/Produits',AN:'Journal des À-nouveaux'};
   document.getElementById('page-journal').innerHTML=`
   <div class="card"><div class="card-header"><h3><i class="fas fa-book"></i> Journaux comptables</h3></div>
   <div class="filter-bar"><label style="font-size:12px;color:var(--text-muted)">Journal:</label>
@@ -1732,6 +1732,170 @@ function restorePlanComptableOfficiel(){
   toast('Plan comptable officiel restauré','fa-rotate-left');
 }
 
+// === IMPORT D'UNE BALANCE (Xlsx / CSV) — reprise des soldes d'ouverture ===
+// L'utilisateur importe la balance de son ancien système (ou de l'exercice
+// précédent). Chaque solde devient une écriture d'à-nouveaux (journal AN)
+// avec pour contrepartie le compte technique 890 « Bilan d'ouverture » :
+// balance, grand livre, journaux, bilans et trésorerie sont ainsi alimentés
+// par le circuit normal des écritures, sans cas particulier.
+const COMPTE_AN='890';
+const BALANCE_HEADER_ALIASES={
+  debit:['debit','debits','solde debiteur','solde debit','sd','mouvement debit','mouvements debit','total debit'],
+  credit:['credit','credits','solde crediteur','solde credit','sc','mouvement credit','mouvements credit','total credit'],
+  solde:['solde','montant'],
+  sens:['sens','d/c','dc','sens du solde']
+};
+// Montant "à la française" ou anglo-saxon : "1 234 567,89", "1.234.567,89",
+// "1,234,567.89", "(1 000)" pour négatif, nombres bruts…
+function parseMontant(v){
+  if(v==null||v==='')return 0;
+  if(typeof v==='number')return v;
+  let s=String(v).replace(/[\s  ]/g,'').replace(/FCFA|XOF|XAF/gi,'');
+  let neg=false;
+  if(/^\(.*\)$/.test(s)){neg=true;s=s.slice(1,-1)}
+  if(s.startsWith('-')){neg=true;s=s.slice(1)}
+  const lastComma=s.lastIndexOf(','),lastDot=s.lastIndexOf('.');
+  if(lastComma>-1&&lastDot>-1){
+    // le séparateur le plus à droite est la décimale, l'autre un séparateur de milliers
+    if(lastComma>lastDot)s=s.replace(/\./g,'').replace(',','.');
+    else s=s.replace(/,/g,'');
+  }else if(lastComma>-1){
+    // virgule seule : décimale si 1-2 chiffres après, sinon milliers
+    s=(s.length-lastComma-1<=2)?s.replace(',','.'):s.replace(/,/g,'');
+  }
+  const n=parseFloat(s);
+  return isNaN(n)?0:(neg?-n:n);
+}
+// Extrait les lignes {c:code, l:libellé, sd:solde signé (D+ / C-)} d'un tableau brut.
+function balanceRowsFromAOA(aoa){
+  if(!aoa||aoa.length<2)return null;
+  let headerIdx=-1,cols=null;
+  for(let i=0;i<Math.min(20,aoa.length);i++){
+    const r=(aoa[i]||[]).map(c=>c==null?'':String(c));
+    if(r.length<2)continue;
+    const base=detectColumns(r); // colonnes code / libellé (aliases existants)
+    const norm=r.map(normHeader);
+    const extra={};
+    Object.keys(BALANCE_HEADER_ALIASES).forEach(key=>{
+      const idx=norm.findIndex(h=>BALANCE_HEADER_ALIASES[key].some(a=>h===normHeader(a)||h.includes(normHeader(a))));
+      if(idx!==-1)extra[key]=idx;
+    });
+    if(base.code!==undefined&&((extra.debit!==undefined&&extra.credit!==undefined)||extra.solde!==undefined)){
+      headerIdx=i;cols={...base,...extra};break;
+    }
+  }
+  if(headerIdx===-1){
+    toast('En-têtes introuvables : il faut une colonne "Compte" et des colonnes "Débit"/"Crédit" (ou "Solde")','fa-triangle-exclamation');
+    return null;
+  }
+  const out=[];
+  for(let i=headerIdx+1;i<aoa.length;i++){
+    const r=aoa[i];if(!r||r.length===0)continue;
+    const code=r[cols.code]!=null?String(r[cols.code]).trim().replace(/\s/g,''):'';
+    const lib=cols.lib!==undefined&&r[cols.lib]!=null?String(r[cols.lib]).trim():'';
+    if(!/^\d{2,}$/.test(code))continue;               // ignore titres, sous-totaux…
+    if(/total|cumul/i.test(lib))continue;
+    let sd;
+    if(cols.debit!==undefined&&cols.credit!==undefined){
+      sd=parseMontant(r[cols.debit])-parseMontant(r[cols.credit]);
+    }else{
+      sd=parseMontant(r[cols.solde]);
+      if(cols.sens!==undefined&&/^c/i.test(String(r[cols.sens]||'').trim()))sd=-Math.abs(sd);
+    }
+    out.push({c:code,l:lib,sd:Math.round(sd*100)/100});
+  }
+  // Une balance contient souvent les niveaux agrégés (classe « 28 » ET compte
+  // « 284 ») : on ne garde que les codes les plus détaillés pour ne pas
+  // compter deux fois les mêmes soldes.
+  const codes=out.map(r=>r.c);
+  const detail=out.filter(r=>!codes.some(c=>c!==r.c&&c.startsWith(r.c)));
+  return detail.filter(r=>Math.abs(r.sd)>=0.005);
+}
+function triggerImportBalance(){document.getElementById('importBalanceFileInput').click()}
+function handleImportBalanceFile(input){
+  const file=input.files&&input.files[0];
+  if(!file)return;
+  const ext=file.name.split('.').pop().toLowerCase();
+  const reader=new FileReader();
+  reader.onload=(e)=>{
+    let rows=null;
+    try{
+      if(ext==='csv'){
+        rows=balanceRowsFromAOA(parseCSV(String(e.target.result)));
+      }else{
+        const wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'});
+        const sheetName=wb.SheetNames.find(n=>/balance|solde/i.test(n))||wb.SheetNames[0];
+        rows=balanceRowsFromAOA(XLSX.utils.sheet_to_json(wb.Sheets[sheetName],{header:1}));
+      }
+    }catch(err){
+      toast('Erreur de lecture du fichier','fa-triangle-exclamation');input.value='';return;
+    }
+    input.value='';
+    if(!rows||rows.length===0){
+      if(rows!==null)toast('Aucun solde exploitable trouvé dans ce fichier','fa-triangle-exclamation');
+      return;
+    }
+    openImportBalanceModal(rows);
+  };
+  if(ext==='csv')reader.readAsText(file,'UTF-8');
+  else reader.readAsArrayBuffer(file);
+}
+function hasImportedBalance(){return state.transactions.some(t=>t.journal==='AN')}
+function openImportBalanceModal(rows){
+  const dev=esc(state.params.devise||'FCFA');
+  const totD=rows.reduce((s,r)=>s+(r.sd>0?r.sd:0),0);
+  const totC=rows.reduce((s,r)=>s+(r.sd<0?-r.sd:0),0);
+  const ecart=Math.round((totD-totC)*100)/100;
+  const inconnus=rows.filter(r=>!state.planComptes[r.c]).length;
+  const treasuryWarn=state.treasuryAccounts.filter(a=>a.opening&&rows.some(r=>r.c===a.id));
+  const exercice=Number(state.params.exercice)||new Date().getFullYear();
+  const fields=[
+    {name:'date',label:'Date des à-nouveaux (généralement le 1er jour de l\'exercice)',type:'date',required:true,value:`${exercice}-01-01`},
+    {name:'inconnus',label:`Comptes absents du plan comptable (${inconnus} détecté${inconnus>1?'s':''})`,type:'select',required:true,options:[
+      {v:'add',l:'Les ajouter automatiquement au plan comptable (recommandé)'},
+      {v:'skip',l:'Ignorer ces lignes'}]}
+  ];
+  if(hasImportedBalance())fields.push({name:'mode',label:'Une balance a déjà été importée dans ce dossier',type:'select',required:true,options:[
+    {v:'replace',l:'La remplacer (les anciens à-nouveaux sont supprimés)'},
+    {v:'append',l:'Ajouter ces soldes en plus (cumul)'}]});
+  showFormModal(`Importer la balance — ${rows.length} comptes détectés`,fields,(vals)=>{
+    applyImportBalance(rows,vals);
+  },{subtitle:`
+    Total soldes débiteurs : <strong>${fmt(totD)} ${dev}</strong> · Total soldes créditeurs : <strong>${fmt(totC)} ${dev}</strong><br>
+    ${Math.abs(ecart)<0.01?'<span style="color:var(--success)">Balance équilibrée ✓</span>':`<span style="color:var(--danger)">Attention : balance déséquilibrée (écart ${fmt(ecart)} ${dev}) — l'écart sera porté au compte ${COMPTE_AN}.</span>`}<br>
+    Chaque solde sera enregistré au journal <strong>AN (À-nouveaux)</strong> en contrepartie du compte technique <strong>${COMPTE_AN} — Bilan d'ouverture</strong>, et alimentera balance, grand livre, bilans et trésorerie.
+    ${treasuryWarn.length?`<br><span style="color:var(--danger)">Attention : ${treasuryWarn.map(a=>a.id+' ('+esc(a.bank)+')').join(', ')} possède déjà un solde initial saisi dans Trésorerie — pour éviter un double comptage, mettez ce solde initial à zéro ou retirez ce compte du fichier.</span>`:''}`});
+}
+function applyImportBalance(rows,vals){
+  const dt=frDate(vals.date);
+  if(!state.planComptes[COMPTE_AN]){
+    state.planComptes[COMPTE_AN]='Bilan d\'ouverture (contrepartie des à-nouveaux)';
+    state.planComptableFull.push({c:COMPTE_AN,l:'Bilan d\'ouverture (contrepartie des à-nouveaux)',niv:'Compte Principal',cl:'Classe 8'});
+  }
+  if(vals.mode==='replace')removeImportedBalance(false);
+  let imported=0,skipped=0;
+  rows.forEach(r=>{
+    if(!state.planComptes[r.c]){
+      if(vals.inconnus==='skip'){skipped++;return}
+      const lib=r.l||('Compte '+r.c);
+      state.planComptes[r.c]=lib;
+      state.planComptableFull.push({c:r.c,l:lib,niv:'Compte Principal',cl:'Classe '+r.c[0]});
+    }
+    const lbl='À-nouveaux — '+(r.l||compteLabel(r.c));
+    if(r.sd>0)addTransaction(dt,lbl,r.c,COMPTE_AN,r.sd,'AN',false);
+    else addTransaction(dt,lbl,COMPTE_AN,r.c,-r.sd,'AN',false);
+    imported++;
+  });
+  refreshAll();
+  toast(`Balance importée : ${imported} soldes repris${skipped?` (${skipped} lignes ignorées)`:''}`,'fa-check');
+}
+function removeImportedBalance(interactive){
+  if(interactive&&!confirm('Supprimer tous les à-nouveaux importés (journal AN) de ce dossier ? Les autres écritures ne sont pas touchées.'))return;
+  state.transactions.filter(t=>t.journal==='AN').forEach(t=>unbumpEvolution(t.d,t.debit,t.credit,t.amount));
+  state.transactions=state.transactions.filter(t=>t.journal!=='AN');
+  if(interactive){refreshAll();toast('À-nouveaux supprimés','fa-trash')}
+}
+
 // === RENDER BALANCE GÉNÉRALE ===
 function renderBalance(){
   const comptes=comptesUtilses_safe();
@@ -1748,7 +1912,14 @@ function renderBalance(){
     return `<tr><td>${c}</td><td>${esc(compteLabel(c))}</td><td style="text-align:right">${fmt(deb)}</td><td style="text-align:right">${fmt(cred)}</td><td style="text-align:right;font-weight:700;color:${solde>=0?'var(--success)':'var(--danger)'}">${fmt(Math.abs(solde))} ${solde>=0?'D':'C'}</td></tr>`;
   }).join('');
   document.getElementById('page-balance').innerHTML=`
-  <div class="card"><div class="card-header"><h3><i class="fas fa-scale-balanced"></i> Balance générale des comptes</h3></div>
+  <div class="card"><div class="card-header"><h3><i class="fas fa-scale-balanced"></i> Balance générale des comptes</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-sm btn-accent" onclick="triggerImportBalance()"><i class="fas fa-upload"></i> Importer une balance (.xlsx / .csv)</button>
+      ${hasImportedBalance()?`<button class="btn btn-sm btn-outline" onclick="removeImportedBalance(true)"><i class="fas fa-trash"></i> Retirer les à-nouveaux importés</button>`:''}
+      <input type="file" id="importBalanceFileInput" accept=".xlsx,.xls,.csv" style="display:none" onchange="handleImportBalanceFile(this)">
+    </div>
+  </div>
+  <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px"><i class="fas fa-circle-info"></i> Importez la balance de votre ancien système ou de l'exercice précédent (colonnes Compte / Libellé / Débit / Crédit, ou Solde) : chaque solde est repris en écriture d'à-nouveaux (journal AN, contrepartie ${COMPTE_AN}) et alimente automatiquement la balance, le grand livre, les journaux, les bilans et la trésorerie.</p>
   <table><thead><tr><th>N° Compte</th><th>Libellé</th><th style="text-align:right">Total Débit</th><th style="text-align:right">Total Crédit</th><th style="text-align:right">Solde</th></tr></thead>
   <tbody>${rows}</tbody>
   <tfoot><tr style="font-weight:800;background:#f8fafc"><td colspan="2">TOTAUX</td><td style="text-align:right">${fmt(totD)}</td><td style="text-align:right">${fmt(totC)}</td><td></td></tr></tfoot></table></div>`;
