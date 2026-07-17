@@ -66,7 +66,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .nav-item.active{background:rgba(13,148,136,.2);border-left-color:var(--accent-light);color:#fff}
 .nav-item i{width:18px;text-align:center}
 /* === MAIN === */
-.main{flex:1;margin-left:var(--sidebar-w);padding:24px}
+.main{flex:1;margin-left:var(--sidebar-w);padding:24px;min-width:0}
 .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;flex-wrap:wrap;gap:12px}
 .topbar h2{font-size:24px;font-weight:700;color:var(--primary)}
 .breadcrumb{font-size:13px;color:var(--text-muted)}
@@ -76,7 +76,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .user-avatar{width:36px;height:36px;border-radius:50%;background:var(--primary);color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700}
 /* === CARDS === */
 .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:20px;margin-bottom:20px}
-.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:8px}
 .card-header h3{font-size:16px;font-weight:700;color:var(--primary)}
 /* === KPI GRID === */
 .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:24px}
@@ -94,6 +94,10 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 .kpi-trend.neutral{color:var(--text-muted)}
 /* === TABLES === */
 table{width:100%;border-collapse:collapse}
+/* Les enfants de grilles/lignes flexibles doivent pouvoir rétrécir sous leur
+   contenu (tableaux, selects longs) au lieu d'élargir la page — cf. min-width:auto. */
+.grid-2>*,.grid-3>*{min-width:0}
+select{max-width:100%;min-width:0}
 th{text-align:left;padding:12px 14px;background:#f8fafc;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);border-bottom:2px solid var(--border);font-weight:700}
 td{padding:12px 14px;border-bottom:1px solid var(--border);font-size:14px}
 tr:hover td{background:#f8fafc}
@@ -149,6 +153,9 @@ tr:hover td{background:#f8fafc}
 @media(max-width:768px){.menu-toggle{display:block}.form-row{grid-template-columns:1fr}}
 /* === RESPONSIVE === */
 @media(max-width:1024px){.grid-2,.grid-3{grid-template-columns:1fr}}
+/* Sur écran étroit, chaque tableau défile horizontalement DANS sa carte au
+   lieu de faire déborder toute la page (le document ne défile jamais en X). */
+@media(max-width:900px){table{display:block;overflow-x:auto;-webkit-overflow-scrolling:touch}}
 @media(max-width:768px){.sidebar{transform:translateX(-100%)}.sidebar.open{transform:translateX(0)}.main{margin-left:0}.kpi-grid{grid-template-columns:1fr 1fr}}
 @media(max-width:480px){.kpi-grid{grid-template-columns:1fr}.topbar h2{font-size:18px}}
 @media print{
@@ -2048,7 +2055,7 @@ function renderBudget(){
   document.getElementById('page-budget').innerHTML=`
   <div class="card"><div class="card-header"><h3><i class="fas fa-coins"></i> Budget prévisionnel — Exercice ${state.params.exercice}</h3>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <select id="budgetAddSelect" class="form-control" style="width:auto;min-width:220px">
+      <select id="budgetAddSelect" class="form-control" style="width:240px;max-width:100%">
         <option value="">+ Ajouter un compte au budget…</option>
         ${remaining.map(c=>`<option value="${esc(c)}">${esc(c)} — ${esc(compteLabel(c))}</option>`).join('')}
       </select>
