@@ -2121,16 +2121,7 @@ function renderRapports(){
 // Impression fiable : génère un document isolé plutôt que de s'appuyer sur
 // window.print() directement dans l'application (fragile à cause de la mise
 // en page complexe — barre latérale, pages masquées, etc. selon navigateurs).
-function printReport(){
-  const content=document.getElementById('page-rapports').innerHTML;
-  const win=window.open('','_blank');
-  if(!win){
-    toast("Le navigateur a bloqué la fenêtre d'impression. Autorisez les pop-ups pour ce site.",'fa-triangle-exclamation');
-    return;
-  }
-  win.document.open();
-  win.document.write(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>Rapport financier — ${esc(state.params.orgName)}</title>
-  <style>
+const PRINT_DOC_CSS=`
   *{box-sizing:border-box}
   body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;color:#1e293b;padding:24px;max-width:900px;margin:0 auto}
   .card{border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:16px;break-inside:avoid}
@@ -2144,12 +2135,23 @@ function printReport(){
   .stat-mini{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #eee;font-size:13px}
   i{display:none}
   p{font-size:12px;color:#64748b}
-  @page{margin:16mm}
-  </style></head><body>${content}</body></html>`);
+  @page{margin:16mm}`;
+function openPrintWindow(title,bodyHtml){
+  const win=window.open('','_blank');
+  if(!win){
+    toast("Le navigateur a bloqué la fenêtre d'impression. Autorisez les pop-ups pour ce site.",'fa-triangle-exclamation');
+    return;
+  }
+  win.document.open();
+  win.document.write(`<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>${title}</title>
+  <style>${PRINT_DOC_CSS}</style></head><body>${bodyHtml}</body></html>`);
   win.document.close();
   const triggerPrint=()=>{try{win.focus();win.print()}catch(e){}};
   win.onload=triggerPrint;
   setTimeout(triggerPrint,400);
+}
+function printReport(){
+  openPrintWindow(`Rapport financier — ${esc(state.params.orgName)}`,document.getElementById('page-rapports').innerHTML);
 }
 function renderMonthlyReportDetail(mk){
   const {income,expense}=monthTotals(mk);
@@ -2425,18 +2427,27 @@ function dotationExercice(im,exercice){
 
 // --- PAGE IMMOBILISATIONS ---
 let _immoPlanOpenId=null;
-function renderImmobilisations(){
+// Lignes du registre avec valeurs calculées (cumul, VNC, dotation de
+// l'exercice) — partagées entre l'affichage, l'export .xlsx et l'impression.
+function immoLignesCalculees(){
   state.immobilisations=state.immobilisations||[];
-  const dev=esc(state.params.devise||'FCFA');
   const exo=Number(state.params.exercice)||new Date().getFullYear();
   const today=new Date().toLocaleDateString('fr-FR');
-  let totVO=0,totCumul=0,totVNC=0,totDot=0;
-  const lignes=state.immobilisations.map(im=>{
+  return state.immobilisations.map(im=>{
     const cede=im.statut==='cede';
     const refDate=cede?im.cession.date:today;
     const cumul=amortCumulA(im,refDate);
     const vnc=r2((Number(im.valeurOrigine)||0)-cumul);
     const dotExo=cede?0:dotationExercice(im,exo);
+    return {im,cede,cumul,vnc,dotExo};
+  });
+}
+function renderImmobilisations(){
+  state.immobilisations=state.immobilisations||[];
+  const dev=esc(state.params.devise||'FCFA');
+  const exo=Number(state.params.exercice)||new Date().getFullYear();
+  let totVO=0,totCumul=0,totVNC=0,totDot=0;
+  const lignes=immoLignesCalculees().map(({im,cede,cumul,vnc,dotExo})=>{
     totVO+=Number(im.valeurOrigine)||0;totCumul+=cumul;totVNC+=vnc;totDot+=dotExo;
     const methLbl=IMMO_METHODES[im.methode]||im.methode;
     const coefTxt=im.methode==='degressif'?` ×${im.coefficient||defaultCoefDegressif(Number(im.duree))}`:'';
@@ -2461,7 +2472,11 @@ function renderImmobilisations(){
   document.getElementById('page-immobilisations').innerHTML=`
   <div class="card">
     <div class="card-header"><h3><i class="fas fa-building"></i> Registre des immobilisations</h3>
-      <button class="btn btn-sm btn-accent" onclick="openImmoModal()"><i class="fas fa-plus"></i> Ajouter une immobilisation</button></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-sm btn-outline" onclick="exportImmobilisationsXlsx()"><i class="fas fa-download"></i> Exporter (.xlsx)</button>
+        <button class="btn btn-sm btn-outline" onclick="printImmobilisations()"><i class="fas fa-print"></i> Imprimer</button>
+        <button class="btn btn-sm btn-accent" onclick="openImmoModal()"><i class="fas fa-plus"></i> Ajouter une immobilisation</button>
+      </div></div>
     <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
       ${[['Valeur brute totale',totVO],['Amortissements cumulés (théoriques)',totCumul],['Valeur nette comptable',totVNC],[`Dotation indicative ${exo}`,totDot]].map(([l,v])=>`
       <div style="flex:1;min-width:170px;background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:12px 14px">
@@ -2639,6 +2654,93 @@ function showImmoCessionRecap(im,c){
     toast('Cession enregistrée — '+txIds.length+' écriture(s) au journal','fa-check');
   };
   if(typeof iconizeAll==='function')iconizeAll();
+}
+
+// --- Export .xlsx du registre et des plans d'amortissement ---
+function exportImmobilisationsXlsx(){
+  const lignes=immoLignesCalculees();
+  if(!lignes.length){toast('Aucune immobilisation à exporter','fa-triangle-exclamation');return}
+  if(typeof XLSX==='undefined'){toast('Bibliothèque Excel indisponible','fa-triangle-exclamation');return}
+  const exo=Number(state.params.exercice)||new Date().getFullYear();
+  const dev=state.params.devise||'FCFA';
+  const totVO=lignes.reduce((s,L)=>s+(Number(L.im.valeurOrigine)||0),0);
+  const totDot=r2(lignes.reduce((s,L)=>s+L.dotExo,0));
+  const totCumul=r2(lignes.reduce((s,L)=>s+L.cumul,0));
+  const totVNC=r2(lignes.reduce((s,L)=>s+L.vnc,0));
+  const aoa=[
+    ['Registre des immobilisations — '+(state.params.orgName||'')],
+    [`Exercice ${exo} — référentiel ${state.params.regime||''} — édité le ${new Date().toLocaleDateString('fr-FR')}`],
+    ['Dotations indicatives : les écritures 681 / 28x restent à comptabiliser manuellement.'],
+    [],
+    ['Code','Désignation','Compte immo.','Compte amort.','Acquisition','Mise en service',`Valeur d'origine (${dev})`,`Valeur résiduelle (${dev})`,'Méthode','Coefficient','Durée (ans)',`Dotation ${exo} (${dev})`,`Amort. cumulés (${dev})`,`VNC (${dev})`,'Statut'],
+    ...lignes.map(({im,cede,cumul,vnc,dotExo})=>[
+      im.code,im.designation,im.compteImmo,im.compteAmort,im.dateAcquisition,im.dateMiseEnService,
+      Number(im.valeurOrigine)||0,Number(im.valeurResiduelle)||0,
+      IMMO_METHODES[im.methode]||im.methode,im.methode==='degressif'?Number(im.coefficient)||'':'',
+      Number(im.duree)||'',dotExo,cumul,vnc,
+      cede?('Cédée le '+im.cession.date+(im.cession.prix?` — prix ${im.cession.prix}`:'')):'Active']),
+    [],
+    ['TOTAUX','','','','','',totVO,'','','','',totDot,totCumul,totVNC,'']
+  ];
+  const ws=XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols']=[{wch:10},{wch:34},{wch:12},{wch:13},{wch:12},{wch:14},{wch:18},{wch:18},{wch:10},{wch:11},{wch:11},{wch:18},{wch:18},{wch:16},{wch:26}];
+  const wb=XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb,ws,'Registre');
+  const aoa2=[['Plans d\'amortissement — '+(state.params.orgName||'')],[]];
+  lignes.forEach(({im})=>{
+    aoa2.push([`${im.code} — ${im.designation} (${IMMO_METHODES[im.methode]||im.methode}${im.methode==='degressif'?` ×${im.coefficient||defaultCoefDegressif(Number(im.duree))}`:''}, ${im.duree} ans, mise en service ${im.dateMiseEnService||im.dateAcquisition})`]);
+    aoa2.push(['Exercice',`VNC début (${dev})`,`Dotation (${dev})`,`Amort. cumulés (${dev})`,`VNC fin (${dev})`]);
+    planAmortissement(im).forEach(r=>aoa2.push([r.exercice,r.vncDebut,r.dotation,r.cumulFin,r.vncFin]));
+    aoa2.push([]);
+  });
+  const ws2=XLSX.utils.aoa_to_sheet(aoa2);
+  ws2['!cols']=[{wch:44},{wch:18},{wch:18},{wch:20},{wch:18}];
+  XLSX.utils.book_append_sheet(wb,ws2,'Plans amortissement');
+  const stamp=new Date().toISOString().slice(0,10);
+  XLSX.writeFile(wb,`GTECH_Immobilisations_${exo}_${stamp}.xlsx`);
+  toast('Export .xlsx téléchargé','fa-download');
+}
+// --- Impression du registre et des plans (document isolé, cf. openPrintWindow) ---
+function printImmobilisations(){
+  const lignes=immoLignesCalculees();
+  if(!lignes.length){toast('Aucune immobilisation à imprimer','fa-triangle-exclamation');return}
+  const exo=Number(state.params.exercice)||new Date().getFullYear();
+  const dev=esc(state.params.devise||'FCFA');
+  const totVO=lignes.reduce((s,L)=>s+(Number(L.im.valeurOrigine)||0),0);
+  const totDot=r2(lignes.reduce((s,L)=>s+L.dotExo,0));
+  const totCumul=r2(lignes.reduce((s,L)=>s+L.cumul,0));
+  const totVNC=r2(lignes.reduce((s,L)=>s+L.vnc,0));
+  const body=`
+  <div class="card">
+    <h3>Registre des immobilisations — ${esc(state.params.orgName)}</h3>
+    <p>Exercice ${exo} — référentiel ${esc(state.params.regime||'')} — édité le ${new Date().toLocaleDateString('fr-FR')}.
+    Dotations indicatives : les écritures 681 / 28x restent à comptabiliser manuellement.</p>
+    <table>
+      <thead><tr><th>Code</th><th>Désignation</th><th>Compte</th><th>Mise en service</th><th style="text-align:right">Valeur d'origine</th><th>Méthode / Durée</th><th style="text-align:right">Dotation ${exo}</th><th style="text-align:right">Amort. cumulés</th><th style="text-align:right">VNC</th><th>Statut</th></tr></thead>
+      <tbody>${lignes.map(({im,cede,cumul,vnc,dotExo})=>`<tr>
+        <td><strong>${esc(im.code)}</strong></td><td>${esc(im.designation)}</td><td>${esc(im.compteImmo)}</td>
+        <td>${esc(im.dateMiseEnService||im.dateAcquisition)}</td><td style="text-align:right">${fmt(im.valeurOrigine)}</td>
+        <td>${esc(IMMO_METHODES[im.methode]||im.methode)}${im.methode==='degressif'?` ×${esc(im.coefficient||defaultCoefDegressif(Number(im.duree)))}`:''} — ${esc(im.duree)} ans</td>
+        <td style="text-align:right">${cede?'—':fmt(dotExo)}</td><td style="text-align:right">${fmt(cumul)}</td>
+        <td style="text-align:right"><strong>${fmt(vnc)}</strong></td><td>${cede?'Cédée le '+esc(im.cession.date):'Active'}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td colspan="4">TOTAUX (${dev})</td><td style="text-align:right">${fmt(totVO)}</td><td></td><td style="text-align:right">${fmt(totDot)}</td><td style="text-align:right">${fmt(totCumul)}</td><td style="text-align:right">${fmt(totVNC)}</td><td></td></tr></tfoot>
+    </table>
+  </div>
+  ${lignes.map(({im})=>{
+    const plan=planAmortissement(im);
+    return `<div class="card">
+    <h3>Plan d'amortissement — ${esc(im.code)} · ${esc(im.designation)}</h3>
+    <p>${esc(IMMO_METHODES[im.methode]||im.methode)}${im.methode==='degressif'?` (coefficient ${esc(im.coefficient||defaultCoefDegressif(Number(im.duree)))})`:''} sur ${esc(im.duree)} ans —
+    acquisition le ${esc(im.dateAcquisition)}, mise en service le ${esc(im.dateMiseEnService||im.dateAcquisition)} —
+    valeur d'origine ${fmt(im.valeurOrigine)} ${dev}${Number(im.valeurResiduelle)?`, valeur résiduelle ${fmt(im.valeurResiduelle)} ${dev}`:''}.
+    Écriture type de dotation : débit 681 / crédit ${esc(im.compteAmort)}.</p>
+    <table>
+      <thead><tr><th>Exercice</th><th style="text-align:right">VNC début</th><th style="text-align:right">Dotation</th><th style="text-align:right">Amort. cumulés</th><th style="text-align:right">VNC fin</th></tr></thead>
+      <tbody>${plan.map(r=>`<tr><td><strong>${r.exercice}</strong></td><td style="text-align:right">${fmt(r.vncDebut)}</td><td style="text-align:right">${fmt(r.dotation)}</td><td style="text-align:right">${fmt(r.cumulFin)}</td><td style="text-align:right">${fmt(r.vncFin)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td>TOTAL</td><td></td><td style="text-align:right">${fmt(plan.reduce((s,r)=>s+r.dotation,0))}</td><td></td><td></td></tr></tfoot>
+    </table></div>`;
+  }).join('')}`;
+  openPrintWindow(`Immobilisations — ${esc(state.params.orgName)}`,body);
 }
 
 // === LAZY RENDERER ===
